@@ -160,27 +160,27 @@ async def username(interaction: discord.Interaction, pseudo: str):
 @app_commands.describe(pseudo="le pseudo a chercher")
 async def sherlock_cmd(interaction: discord.Interaction, pseudo: str):
     await interaction.response.defer()
-    outfile = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            outfile = f.name
         proc = await asyncio.create_subprocess_exec(
             "sherlock", pseudo, "--print-found", "--timeout", "20",
-            "--output", outfile,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await asyncio.wait_for(proc.communicate(), timeout=300)
-        with open(outfile, "r", errors="ignore") as f:
-            content = f.read()
-        lines = [l.strip() for l in content.splitlines() if l.strip().startswith("http")]
-        embed = discord.Embed(title=f"Sherlock — {pseudo}", color=0x00b0ff if lines else 0xff3b30)
-        if lines:
-            embed.add_field(name=f"Trouve sur {len(lines)} site(s)", value="\n".join(f"• {l}" for l in lines[:25]), inline=False)
-            if len(lines) > 25:
-                embed.set_footer(text=f"+{len(lines)-25} autres resultats")
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+        output = stdout.decode(errors="ignore")
+        results = []
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("[+]"):
+                clean = line[3:].strip()
+                results.append(clean)
+        embed = discord.Embed(title=f"Sherlock — {pseudo}", color=0x00b0ff if results else 0xff3b30)
+        if results:
+            embed.add_field(name=f"Trouve sur {len(results)} site(s)", value="\n".join(f"• {r}" for r in results[:25]), inline=False)
+            if len(results) > 25:
+                embed.set_footer(text=f"+{len(results)-25} autres resultats")
             else:
-                embed.set_footer(text="scan sherlock-project — timeout 20s/site")
+                embed.set_footer(text="scan sherlock-project")
         else:
             embed.description = "aucun resultat public"
         await interaction.followup.send(embed=embed)
