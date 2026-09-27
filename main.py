@@ -1,77 +1,175 @@
 # language: Python, file: main.py
 # target: Python 3.11+, discord.py 2.x
-# *sources publiques uniquement — pas d'accès privé*
+# *sources publiques uniquement*
 
 import os
+import io
+import socket
+import asyncio
+from urllib.parse import urlparse, unquote
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 import aiohttp
-import asyncio
-import socket
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
 
 TOKEN = os.environ["TOKEN"]
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 TIMEOUT = 15
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
+# ============================================================
+# USERNAME SITES — avec signature "not found" pour filtrer les faux positifs
+# format : nom -> (url, [signatures "not found"])
+# signature None = check status code seulement
+# ============================================================
 USERNAME_SITES = {
-    "GitHub":       "https://github.com/{}",
-    "Twitter/X":    "https://x.com/{}",
-    "Instagram":    "https://instagram.com/{}",
-    "Reddit":       "https://reddit.com/user/{}",
-    "TikTok":       "https://tiktok.com/@{}",
-    "Twitch":       "https://twitch.tv/{}",
-    "YouTube":      "https://youtube.com/@{}",
-    "Steam":        "https://steamcommunity.com/id/{}",
-    "Pinterest":    "https://pinterest.com/{}",
-    "Telegram":     "https://t.me/{}",
-    "Snapchat":     "https://snapchat.com/add/{}",
-    "Roblox":       "https://roblox.com/user.aspx?username={}",
-    "Spotify":      "https://open.spotify.com/user/{}",
-    "Medium":       "https://medium.com/@{}",
-    "DeviantArt":   "https://deviantart.com/{}",
-    "Patreon":      "https://patreon.com/{}",
-    "SoundCloud":   "https://soundcloud.com/{}",
-    "Behance":      "https://behance.net/{}",
-    "Dribbble":     "https://dribbble.com/{}",
-    "GitLab":       "https://gitlab.com/{}",
-    "BitBucket":    "https://bitbucket.org/{}",
-    "Keybase":      "https://keybase.io/{}",
-    "Mastodon":     "https://mastodon.social/@{}",
-    "VK":           "https://vk.com/{}",
-    "Flickr":       "https://flickr.com/people/{}",
+    "GitHub":       ("https://github.com/{}", ["Not Found"]),
+    "Twitter/X":    ("https://x.com/{}", None),
+    "Instagram":    ("https://instagram.com/{}", ["Sorry, this page isn't available", "Page Not Found"]),
+    "Reddit":       ("https://reddit.com/user/{}", ["page not found", "Sorry, nobody on Reddit"]),
+    "TikTok":       ("https://tiktok.com/@{}", ["Couldn't find this account", "Couldn't find this user"]),
+    "Twitch":       ("https://twitch.tv/{}", None),
+    "YouTube":      ("https://youtube.com/@{}", ["This page isn't available"]),
+    "Steam":        ("https://steamcommunity.com/id/{}", ["The specified profile could not be found"]),
+    "Pinterest":    ("https://pinterest.com/{}", ["Sorry! We couldn't find that page"]),
+    "Telegram":     ("https://t.me/{}", ["tgme_page_icon", "If you have Telegram"]),
+    "Snapchat":     ("https://snapchat.com/add/{}", ["This content could not be found"]),
+    "Roblox":       ("https://roblox.com/user.aspx?username={}", ["Page cannot be found"]),
+    "Spotify":      ("https://open.spotify.com/user/{}", ["Page not found"]),
+    "Medium":       ("https://medium.com/@{}", ["404"]),
+    "DeviantArt":   ("https://deviantart.com/{}", ["Page Not Found"]),
+    "Patreon":      ("https://patreon.com/{}", ["Page not found"]),
+    "SoundCloud":   ("https://soundcloud.com/{}", ["We can't find that user"]),
+    "Behance":      ("https://behance.net/{}", ["Page not found"]),
+    "Dribbble":     ("https://dribbble.com/{}", ["Page not found"]),
+    "GitLab":       ("https://gitlab.com/{}", ["404"]),
+    "BitBucket":    ("https://bitbucket.org/{}", ["404"]),
+    "Keybase":      ("https://keybase.io/{}", None),
+    "Mastodon":     ("https://mastodon.social/@{}", ["Page not found"]),
+    "VK":           ("https://vk.com/{}", None),
+    "Flickr":       ("https://flickr.com/people/{}", ["Page not found"]),
+    "Tumblr":       ("https://{}.tumblr.com", None),
+    "Wattpad":      ("https://wattpad.com/user/{}", ["Page not found"]),
+    "Vimeo":        ("https://vimeo.com/{}", ["Page not found"]),
+    "Chess.com":    ("https://chess.com/member/{}", ["Page not found"]),
 }
 
-async def check_url(session, url):
+# ============================================================
+# HELPERS
+# ============================================================
+async def check_username_site(session, username, site_data):
+    """vérifie un site avec signature de contenu, retourne (nom, True/False)"""
+    url, signatures = site_data
+    target = url.format(username)
     try:
-        async with session.head(url, timeout=aiohttp.ClientTimeout(total=TIMEOUT),
-                                 allow_redirects=True) as r:
-            return r.status == 200
+        async with session.get(target, timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+                               allow_redirects=True) as r:
+            if r.status != 200:
+                return False
+            if signatures is None:
+                return True
+            text = await r.text(errors="ignore")
+            text_lower = text.lower()
+            for sig in signatures:
+                if sig.lower() in text_lower:
+                    return False
+            return True
     except Exception:
         return False
 
+
 async def scan_username(username):
     found = []
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        tasks = {name: check_url(session, url.format(username))
-                 for name, url in USERNAME_SITES.items()}
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for (name, _), res in zip(tasks.items(), results):
-            if res is True:
+    async with aiohttp.ClientSession(headers={"User-Agent": UA}) as session:
+        tasks = [check_username_site(session, username, data)
+                 for data in USERNAME_SITES.values()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for (name, _), ok in zip(USERNAME_SITES.items(), results):
+            if ok is True:
                 found.append(name)
     return found
 
-async def dns_lookup(domain):
+
+def extract_exif(image_bytes):
+    """extrait les métadonnées EXIF d'une image"""
+    out = {}
     try:
-        return socket.gethostbyname(domain)
+        img = Image.open(io.BytesIO(image_bytes))
+        out["format"] = img.format
+        out["size"] = f"{img.width}x{img.height}"
+        exif = img.getexif()
+        if not exif:
+            return out
+        for tag_id, value in exif.items():
+            tag = TAGS.get(tag_id, tag_id)
+            if tag == "GPSInfo":
+                gps = {}
+                for k, v in value.items():
+                    gps[GPSTAGS.get(k, k)] = v
+                out["GPS"] = gps
+            else:
+                if isinstance(value, bytes):
+                    continue
+                out[str(tag)] = str(value)[:200]
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def gps_to_decimal(gps_info):
+    """convertit les coordonnées GPS EXIF en décimal"""
+    try:
+        def to_deg(v):
+            d, m, s = v
+            return float(d) + float(m) / 60 + float(s) / 3600
+        lat = to_deg(gps_info["GPSLatitude"])
+        lon = to_deg(gps_info["GPSLongitude"])
+        if gps_info.get("GPSLatitudeRef") == "S":
+            lat = -lat
+        if gps_info.get("GPSLongitudeRef") == "W":
+            lon = -lon
+        return lat, lon
     except Exception:
         return None
 
-@tree.command(name="username", description="scanne un pseudo sur les sites publics")
+
+async def trace_url(url):
+    """suit les redirections et retourne la chaine"""
+    chain = [url]
+    try:
+        async with aiohttp.ClientSession(headers={"User-Agent": UA}) as session:
+            current = url
+            for _ in range(10):
+                async with session.get(current, timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+                                       allow_redirects=False) as r:
+                    if r.status in (301, 302, 303, 307, 308):
+                        loc = r.headers.get("Location")
+                        if not loc:
+                            break
+                        if loc.startswith("/"):
+                            p = urlparse(current)
+                            loc = f"{p.scheme}://{p.netloc}{loc}"
+                        chain.append(loc)
+                        current = loc
+                    else:
+                        break
+    except Exception as e:
+        chain.append(f"erreur: {e}")
+    return chain
+
+
+# ============================================================
+# COMMANDES
+# ============================================================
+@tree.command(name="username", description="scanne un pseudo sur ~30 sites publics")
 @app_commands.describe(pseudo="le pseudo à chercher")
 async def username(interaction: discord.Interaction, pseudo: str):
     await interaction.response.defer()
@@ -88,8 +186,9 @@ async def username(interaction: discord.Interaction, pseudo: str):
         )
     else:
         embed.description = "aucun résultat public"
-    embed.set_footer(text="sources publiques uniquement")
+    embed.set_footer(text="détection par contenu — sources publiques")
     await interaction.followup.send(embed=embed)
+
 
 @tree.command(name="email", description="check une adresse email dans les fuites publiques")
 @app_commands.describe(email="l'email à vérifier")
@@ -97,48 +196,200 @@ async def email(interaction: discord.Interaction, email: str):
     embed = discord.Embed(title="OSINT — email", color=0x00b0ff)
     embed.add_field(name="cible", value=f"`{email}`", inline=False)
     embed.add_field(name="HaveIBeenPwned",
-                    value=f"https://haveibeenpwned.com/account/{email}",
-                    inline=False)
-    embed.set_footer(text="vérifie manuellement le lien")
+                    value=f"https://haveibeenpwned.com/account/{email}", inline=False)
+    embed.add_field(name="Firefox Monitor",
+                    value=f"https://monitor.mozilla.org/?email={email}", inline=False)
+    embed.add_field(name="DeHashed (recherche)",
+                    value=f"https://dehashed.com/search?query={email}", inline=False)
+    embed.set_footer(text="vérifie manuellement les liens")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="domain", description="résolution DNS + infos sur un domaine")
+
+@tree.command(name="domain", description="DNS + WHOIS + crt.sh + archive")
 @app_commands.describe(domain="le domaine (ex: example.com)")
 async def domain(interaction: discord.Interaction, domain: str):
     await interaction.response.defer()
-    ip = await dns_lookup(domain)
+    try:
+        ip = socket.gethostbyname(domain)
+    except Exception:
+        ip = "échec"
     embed = discord.Embed(title=f"OSINT — {domain}", color=0x00b0ff)
-    embed.add_field(name="IP résolue", value=ip or "échec", inline=False)
+    embed.add_field(name="IP résolue", value=ip, inline=False)
     embed.add_field(name="WHOIS", value=f"https://who.is/whois/{domain}", inline=False)
-    embed.add_field(name="crt.sh", value=f"https://crt.sh/?q={domain}", inline=False)
-    embed.add_field(name="Wayback",
-                    value=f"https://web.archive.org/web/*/{domain}",
-                    inline=False)
-    embed.set_footer(text="sources publiques uniquement")
+    embed.add_field(name="crt.sh (sous-domaines)", value=f"https://crt.sh/?q={domain}", inline=False)
+    embed.add_field(name="Wayback Machine",
+                    value=f"https://web.archive.org/web/*/{domain}", inline=False)
+    embed.add_field(name="VirusTotal", value=f"https://virustotal.com/gui/domain/{domain}", inline=False)
+    embed.add_field(name="urlscan.io", value=f"https://urlscan.io/domain/{domain}", inline=False)
+    embed.set_footer(text="sources publiques")
     await interaction.followup.send(embed=embed)
 
-@tree.command(name="ip", description="infos basiques sur une IP")
+
+@tree.command(name="dns", description="résolution DNS complète (A, MX, NS, TXT)")
+@app_commands.describe(domain="le domaine à interroger")
+async def dns(interaction: discord.Interaction, domain: str):
+    await interaction.response.defer()
+    records = {}
+    try:
+        loop = asyncio.get_event_loop()
+        records["A"] = await loop.run_in_executor(None, lambda: socket.gethostbyname_ex(domain)[2])
+    except Exception:
+        records["A"] = ["échec"]
+    embed = discord.Embed(title=f"DNS — {domain}", color=0x00b0ff)
+    embed.add_field(name="A (IPv4)", value="\n".join(records["A"]), inline=False)
+    embed.add_field(name="Vérif MX / NS / TXT",
+                    value=f"https://dns.google/query?name={domain}&type=MX\n"
+                          f"https://dns.google/query?name={domain}&type=NS\n"
+                          f"https://dns.google/query?name={domain}&type=TXT",
+                    inline=False)
+    embed.set_footer(text="socket + dns.google")
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="whois", description="whois complet d'un domaine")
+@app_commands.describe(domain="le domaine")
+async def whois(interaction: discord.Interaction, domain: str):
+    embed = discord.Embed(title=f"WHOIS — {domain}", color=0x00b0ff)
+    embed.add_field(name="who.is", value=f"https://who.is/whois/{domain}", inline=False)
+    embed.add_field(name="ICANN Lookup",
+                    value=f"https://lookup.icann.org/en/lookup?name={domain}", inline=False)
+    embed.add_field(name="DomainTools",
+                    value=f"https://whois.domaintools.com/{domain}", inline=False)
+    embed.set_footer(text="sources publiques")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="ip", description="infos sur une IP")
 @app_commands.describe(ip="l'adresse IP")
 async def ip_lookup(interaction: discord.Interaction, ip: str):
     embed = discord.Embed(title=f"OSINT — {ip}", color=0x00b0ff)
     embed.add_field(name="ipinfo.io", value=f"https://ipinfo.io/{ip}", inline=False)
     embed.add_field(name="Shodan", value=f"https://shodan.io/host/{ip}", inline=False)
-    embed.set_footer(text="sources publiques uniquement")
+    embed.add_field(name="AbuseIPDB",
+                    value=f"https://abuseipdb.com/check/{ip}", inline=False)
+    embed.add_field(name="VirusTotal", value=f"https://virustotal.com/gui/ip-address/{ip}", inline=False)
+    embed.set_footer(text="sources publiques")
     await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="image", description="extrait les métadonnées EXIF d'une image (upload)")
+@app_commands.describe(fichier="l'image à analyser (PNG/JPG)")
+async def image_cmd(interaction: discord.Interaction, fichier: discord.Attachment):
+    await interaction.response.defer()
+    try:
+        data = await fichier.read()
+        exif = extract_exif(data)
+    except Exception as e:
+        await interaction.followup.send(f"erreur lecture : {e}")
+        return
+    embed = discord.Embed(title="EXIF — image", color=0x00b0ff)
+    if "format" in exif:
+        embed.add_field(name="format", value=f"{exif.get('format')} — {exif.get('size')}", inline=False)
+    if "GPS" in exif:
+        coords = gps_to_decimal(exif["GPS"])
+        if coords:
+            lat, lon = coords
+            embed.add_field(name="📍 GPS",
+                            value=f"{lat:.6f}, {lon:.6f}\n"
+                                  f"[Google Maps](https://maps.google.com/?q={lat},{lon})",
+                            inline=False)
+        else:
+            embed.add_field(name="GPS (brut)", value=str(exif["GPS"])[:1000], inline=False)
+    interesting = ["Make", "Model", "DateTime", "Software", "LensModel", "Artist", "Copyright"]
+    for k in interesting:
+        if k in exif:
+            embed.add_field(name=k, value=exif[k][:200], inline=False)
+    if len(embed.fields) == 0:
+        embed.description = "aucune métadonnée EXIF (image nettoyée ou format non supporté)"
+    embed.set_footer(text=f"analyse de {fichier.filename}")
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="reverse", description="reverse image search (upload une image)")
+@app_commands.describe(fichier="l'image à chercher")
+async def reverse(interaction: discord.Interaction, fichier: discord.Attachment):
+    embed = discord.Embed(title="Reverse image search", color=0x00b0ff)
+    embed.add_field(
+        name="moteurs",
+        value="Upload l'image sur un des sites ci-dessous :\n"
+              "• [Google Images](https://images.google.com/)\n"
+              "• [Yandex Images](https://yandex.com/images/)\n"
+              "• [TinEye](https://tineye.com/)\n"
+              "• [Bing Visual](https://www.bing.com/visualsearch)",
+        inline=False
+    )
+    embed.set_footer(text="upload manuel requis — bot fournit les liens")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="trace", description="déballe une URL raccourcie vers sa destination")
+@app_commands.describe(url="l'URL à tracer")
+async def trace(interaction: discord.Interaction, url: str):
+    await interaction.response.defer()
+    if not url.startswith("http"):
+        url = "http://" + url
+    chain = await trace_url(url)
+    embed = discord.Embed(title="URL trace", color=0x00b0ff)
+    embed.add_field(
+        name=f"{len(chain)} étape(s)",
+        value="\n".join(f"{i+1}. {u[:150]}" for i, u in enumerate(chain)),
+        inline=False
+    )
+    embed.set_footer(text="chaîne de redirections")
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="phone", description="lookup basique d'un numéro de téléphone")
+@app_commands.describe(numero="le numéro (format international ex: +33612345678)")
+async def phone(interaction: discord.Interaction, numero: str):
+    clean = "".join(c for c in numero if c.isdigit() or c == "+")
+    embed = discord.Embed(title=f"OSINT — {numero}", color=0x00b0ff)
+    embed.add_field(name="Truecaller",
+                    value=f"https://truecaller.com/search/{clean}", inline=False)
+    embed.add_field(name="NumLookup",
+                    value=f"https://numlookup.com/phone-lookup?phone={clean}", inline=False)
+    embed.add_field(name="Free Carrier Lookup",
+                    value=f"https://freecarrierlookup.com/", inline=False)
+    embed.set_footer(text="sources publiques — vérif manuelle")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="steam", description="lookup un profil Steam")
+@app_commands.describe(pseudo="le pseudo Steam ou SteamID")
+async def steam(interaction: discord.Interaction, pseudo: str):
+    embed = discord.Embed(title=f"Steam — {pseudo}", color=0x00b0ff)
+    embed.add_field(name="profil",
+                    value=f"https://steamcommunity.com/id/{pseudo}", inline=False)
+    embed.add_field(name="SteamID lookup",
+                    value=f"https://steamid.io/lookup/{pseudo}", inline=False)
+    embed.add_field(name="SteamDB",
+                    value=f"https://steamdb.info/search/?a=user&q={pseudo}", inline=False)
+    embed.set_footer(text="sources publiques")
+    await interaction.response.send_message(embed=embed)
+
 
 @tree.command(name="help", description="liste des commandes OSINT")
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="Bot OSINT — commandes", color=0x00b0ff)
-    embed.add_field(name="/username", value="scanne un pseudo sur 25 sites", inline=False)
-    embed.add_field(name="/email", value="check email dans HIBP", inline=False)
-    embed.add_field(name="/domain", value="DNS + WHOIS + crt.sh + archive", inline=False)
-    embed.add_field(name="/ip", value="ipinfo + shodan", inline=False)
+    embed.add_field(name="/username", value="scanne un pseudo sur ~30 sites", inline=False)
+    embed.add_field(name="/email", value="check email dans HIBP + Firefox Monitor", inline=False)
+    embed.add_field(name="/domain", value="DNS + WHOIS + crt.sh + archive + VT", inline=False)
+    embed.add_field(name="/dns", value="résolution DNS A/MX/NS/TXT", inline=False)
+    embed.add_field(name="/whois", value="whois complet d'un domaine", inline=False)
+    embed.add_field(name="/ip", value="ipinfo + Shodan + AbuseIPDB + VT", inline=False)
+    embed.add_field(name="/image", value="extrait EXIF (GPS, appareil, date)", inline=False)
+    embed.add_field(name="/reverse", value="reverse image search", inline=False)
+    embed.add_field(name="/trace", value="déballe URL raccourcie", inline=False)
+    embed.add_field(name="/phone", value="lookup numéro", inline=False)
+    embed.add_field(name="/steam", value="lookup profil Steam", inline=False)
     embed.set_footer(text="sources ouvertes uniquement")
     await interaction.response.send_message(embed=embed)
+
 
 @bot.event
 async def on_ready():
     await tree.sync()
     print(f"connecté : {bot.user}")
+
 
 bot.run(TOKEN)
