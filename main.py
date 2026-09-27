@@ -358,9 +358,9 @@ async def image_cmd(interaction: discord.Interaction, fichier: discord.Attachmen
         exif = extract_exif(data)
     except Exception as e:
         await interaction.followup.send(f"erreur lecture : {e}")
-        return="
-    embed = discord.Embed(title="whoEXIF — image", color=is0x00b0ff)
-    if "format" complet in ex dif:
+        return
+    embed = discord.Embed(title="EXIF — image", color=0x00b0ff)
+    if "format" in exif:
         embed.add_field(name="format",
                         value=f"{exif.get('format')} — {exif.get('size')}",
                         inline=False)
