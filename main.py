@@ -6,7 +6,9 @@ import os
 import io
 import socket
 import asyncio
-from urllib.parse import urlparse, unquote
+import subprocess
+import tempfile
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -18,7 +20,6 @@ from PIL.ExifTags import TAGS, GPSTAGS
 TOKEN = os.environ["TOKEN"]
 
 intents = discord.Intents.default()
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
@@ -26,9 +27,8 @@ TIMEOUT = 15
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 # ============================================================
-# USERNAME SITES — avec signature "not found" pour filtrer les faux positifs
-# format : nom -> (url, [signatures "not found"])
-# signature None = check status code seulement
+# USERNAME SITES — detection par signature de contenu
+# format : nom -> (url, [signatures "not found"] ou None)
 # ============================================================
 USERNAME_SITES = {
     "GitHub":       ("https://github.com/{}", ["Not Found"]),
@@ -66,7 +66,6 @@ USERNAME_SITES = {
 # HELPERS
 # ============================================================
 async def check_username_site(session, username, site_data):
-    """vérifie un site avec signature de contenu, retourne (nom, True/False)"""
     url, signatures = site_data
     target = url.format(username)
     try:
@@ -99,7 +98,6 @@ async def scan_username(username):
 
 
 def extract_exif(image_bytes):
-    """extrait les métadonnées EXIF d'une image"""
     out = {}
     try:
         img = Image.open(io.BytesIO(image_bytes))
@@ -125,7 +123,6 @@ def extract_exif(image_bytes):
 
 
 def gps_to_decimal(gps_info):
-    """convertit les coordonnées GPS EXIF en décimal"""
     try:
         def to_deg(v):
             d, m, s = v
@@ -142,7 +139,6 @@ def gps_to_decimal(gps_info):
 
 
 async def trace_url(url):
-    """suit les redirections et retourne la chaine"""
     chain = [url]
     try:
         async with aiohttp.ClientSession(headers={"User-Agent": UA}) as session:
@@ -190,6 +186,87 @@ async def username(interaction: discord.Interaction, pseudo: str):
     await interaction.followup.send(embed=embed)
 
 
+@tree.command(name="sherlock", description="scan étendu — 400+ sites via Sherlock")
+@app_commands.describe(pseudo="le pseudo à chercher")
+async def sherlock_cmd(interaction: discord.Interaction, pseudo: str):
+    await interaction.response.defer()
+    outfile = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            outfile = f.name
+        proc = await asyncio.create_subprocess_exec(
+            "sherlock", pseudo, "--print-found", "--timeout", "10",
+            "--output", outfile,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=150)
+        with open(outfile, "r", errors="ignore") as f:
+            content = f.read()
+        lines = [l.strip() for l in content.splitlines() if l.strip().startswith("http")]
+        embed = discord.Embed(
+            title=f"Sherlock — {pseudo}",
+            color=0x00b0ff if lines else 0xff3b30
+        )
+        if lines:
+            embed.add_field(
+                name=f"Trouvé sur {len(lines)} site(s)",
+                value="\n".join(f"• {l}" for l in lines[:25]),
+                inline=False
+            )
+            if len(lines) > 25:
+                embed.set_footer(text=f"+{len(lines)-25} autres résultats")
+            else:
+                embed.set_footer(text="scan sherlock-project")
+        else:
+            embed.description = "aucun résultat public"
+        await interaction.followup.send(embed=embed)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("⏱️ timeout — le scan a dépassé 2min30")
+    except Exception as e:
+        await interaction.followup.send(f"erreur : {str(e)[:200]}")
+
+
+@tree.command(name="holehe", description="check si un email est enregistré sur 120+ sites")
+@app_commands.describe(email="l'adresse email à vérifier")
+async def holehe_cmd(interaction: discord.Interaction, email: str):
+    await interaction.response.defer()
+    if "@" not in email:
+        await interaction.followup.send("email invalide")
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "holehe", email, "--only-used",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=150)
+        output = stdout.decode(errors="ignore")
+        sites = [l.strip() for l in output.splitlines() if l.strip().startswith("[+]")]
+        embed = discord.Embed(
+            title=f"Holehe — {email}",
+            color=0x00b0ff if sites else 0xff3b30
+        )
+        if sites:
+            cleaned = [s.replace("[+]", "•").strip() for s in sites]
+            embed.add_field(
+                name=f"Enregistré sur {len(sites)} site(s)",
+                value="\n".join(cleaned[:25]),
+                inline=False
+            )
+            if len(sites) > 25:
+                embed.set_footer(text=f"+{len(sites)-25} autres — la cible n'est pas notifiée")
+            else:
+                embed.set_footer(text="détection via recovery — cible non notifiée")
+        else:
+            embed.description = "aucun compte détecté"
+        await interaction.followup.send(embed=embed)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("⏱️ timeout — le scan a dépassé 2min30")
+    except Exception as e:
+        await interaction.followup.send(f"erreur : {str(e)[:200]}")
+
+
 @tree.command(name="email", description="check une adresse email dans les fuites publiques")
 @app_commands.describe(email="l'email à vérifier")
 async def email(interaction: discord.Interaction, email: str):
@@ -199,7 +276,7 @@ async def email(interaction: discord.Interaction, email: str):
                     value=f"https://haveibeenpwned.com/account/{email}", inline=False)
     embed.add_field(name="Firefox Monitor",
                     value=f"https://monitor.mozilla.org/?email={email}", inline=False)
-    embed.add_field(name="DeHashed (recherche)",
+    embed.add_field(name="DeHashed",
                     value=f"https://dehashed.com/search?query={email}", inline=False)
     embed.set_footer(text="vérifie manuellement les liens")
     await interaction.response.send_message(embed=embed)
@@ -216,28 +293,28 @@ async def domain(interaction: discord.Interaction, domain: str):
     embed = discord.Embed(title=f"OSINT — {domain}", color=0x00b0ff)
     embed.add_field(name="IP résolue", value=ip, inline=False)
     embed.add_field(name="WHOIS", value=f"https://who.is/whois/{domain}", inline=False)
-    embed.add_field(name="crt.sh (sous-domaines)", value=f"https://crt.sh/?q={domain}", inline=False)
-    embed.add_field(name="Wayback Machine",
+    embed.add_field(name="crt.sh", value=f"https://crt.sh/?q={domain}", inline=False)
+    embed.add_field(name="Wayback",
                     value=f"https://web.archive.org/web/*/{domain}", inline=False)
-    embed.add_field(name="VirusTotal", value=f"https://virustotal.com/gui/domain/{domain}", inline=False)
+    embed.add_field(name="VirusTotal",
+                    value=f"https://virustotal.com/gui/domain/{domain}", inline=False)
     embed.add_field(name="urlscan.io", value=f"https://urlscan.io/domain/{domain}", inline=False)
     embed.set_footer(text="sources publiques")
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="dns", description="résolution DNS complète (A, MX, NS, TXT)")
+@tree.command(name="dns", description="résolution DNS complète")
 @app_commands.describe(domain="le domaine à interroger")
 async def dns(interaction: discord.Interaction, domain: str):
     await interaction.response.defer()
-    records = {}
     try:
         loop = asyncio.get_event_loop()
-        records["A"] = await loop.run_in_executor(None, lambda: socket.gethostbyname_ex(domain)[2])
+        a_records = await loop.run_in_executor(None, lambda: socket.gethostbyname_ex(domain)[2])
     except Exception:
-        records["A"] = ["échec"]
+        a_records = ["échec"]
     embed = discord.Embed(title=f"DNS — {domain}", color=0x00b0ff)
-    embed.add_field(name="A (IPv4)", value="\n".join(records["A"]), inline=False)
-    embed.add_field(name="Vérif MX / NS / TXT",
+    embed.add_field(name="A (IPv4)", value="\n".join(a_records), inline=False)
+    embed.add_field(name="MX / NS / TXT",
                     value=f"https://dns.google/query?name={domain}&type=MX\n"
                           f"https://dns.google/query?name={domain}&type=NS\n"
                           f"https://dns.google/query?name={domain}&type=TXT",
@@ -251,7 +328,7 @@ async def dns(interaction: discord.Interaction, domain: str):
 async def whois(interaction: discord.Interaction, domain: str):
     embed = discord.Embed(title=f"WHOIS — {domain}", color=0x00b0ff)
     embed.add_field(name="who.is", value=f"https://who.is/whois/{domain}", inline=False)
-    embed.add_field(name="ICANN Lookup",
+    embed.add_field(name="ICANN",
                     value=f"https://lookup.icann.org/en/lookup?name={domain}", inline=False)
     embed.add_field(name="DomainTools",
                     value=f"https://whois.domaintools.com/{domain}", inline=False)
@@ -267,12 +344,13 @@ async def ip_lookup(interaction: discord.Interaction, ip: str):
     embed.add_field(name="Shodan", value=f"https://shodan.io/host/{ip}", inline=False)
     embed.add_field(name="AbuseIPDB",
                     value=f"https://abuseipdb.com/check/{ip}", inline=False)
-    embed.add_field(name="VirusTotal", value=f"https://virustotal.com/gui/ip-address/{ip}", inline=False)
+    embed.add_field(name="VirusTotal",
+                    value=f"https://virustotal.com/gui/ip-address/{ip}", inline=False)
     embed.set_footer(text="sources publiques")
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="image", description="extrait les métadonnées EXIF d'une image (upload)")
+@tree.command(name="image", description="extrait les métadonnées EXIF d'une image")
 @app_commands.describe(fichier="l'image à analyser (PNG/JPG)")
 async def image_cmd(interaction: discord.Interaction, fichier: discord.Attachment):
     await interaction.response.defer()
@@ -284,7 +362,9 @@ async def image_cmd(interaction: discord.Interaction, fichier: discord.Attachmen
         return
     embed = discord.Embed(title="EXIF — image", color=0x00b0ff)
     if "format" in exif:
-        embed.add_field(name="format", value=f"{exif.get('format')} — {exif.get('size')}", inline=False)
+        embed.add_field(name="format",
+                        value=f"{exif.get('format')} — {exif.get('size')}",
+                        inline=False)
     if "GPS" in exif:
         coords = gps_to_decimal(exif["GPS"])
         if coords:
@@ -305,24 +385,24 @@ async def image_cmd(interaction: discord.Interaction, fichier: discord.Attachmen
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="reverse", description="reverse image search (upload une image)")
+@tree.command(name="reverse", description="reverse image search")
 @app_commands.describe(fichier="l'image à chercher")
 async def reverse(interaction: discord.Interaction, fichier: discord.Attachment):
     embed = discord.Embed(title="Reverse image search", color=0x00b0ff)
     embed.add_field(
         name="moteurs",
-        value="Upload l'image sur un des sites ci-dessous :\n"
+        value="Upload l'image sur un des sites :\n"
               "• [Google Images](https://images.google.com/)\n"
               "• [Yandex Images](https://yandex.com/images/)\n"
               "• [TinEye](https://tineye.com/)\n"
               "• [Bing Visual](https://www.bing.com/visualsearch)",
         inline=False
     )
-    embed.set_footer(text="upload manuel requis — bot fournit les liens")
+    embed.set_footer(text="upload manuel requis")
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="trace", description="déballe une URL raccourcie vers sa destination")
+@tree.command(name="trace", description="déballe une URL raccourcie")
 @app_commands.describe(url="l'URL à tracer")
 async def trace(interaction: discord.Interaction, url: str):
     await interaction.response.defer()
@@ -339,7 +419,7 @@ async def trace(interaction: discord.Interaction, url: str):
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="phone", description="lookup basique d'un numéro de téléphone")
+@tree.command(name="phone", description="lookup numéro de téléphone")
 @app_commands.describe(numero="le numéro (format international ex: +33612345678)")
 async def phone(interaction: discord.Interaction, numero: str):
     clean = "".join(c for c in numero if c.isdigit() or c == "+")
@@ -349,7 +429,7 @@ async def phone(interaction: discord.Interaction, numero: str):
     embed.add_field(name="NumLookup",
                     value=f"https://numlookup.com/phone-lookup?phone={clean}", inline=False)
     embed.add_field(name="Free Carrier Lookup",
-                    value=f"https://freecarrierlookup.com/", inline=False)
+                    value="https://freecarrierlookup.com/", inline=False)
     embed.set_footer(text="sources publiques — vérif manuelle")
     await interaction.response.send_message(embed=embed)
 
@@ -372,6 +452,8 @@ async def steam(interaction: discord.Interaction, pseudo: str):
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="Bot OSINT — commandes", color=0x00b0ff)
     embed.add_field(name="/username", value="scanne un pseudo sur ~30 sites", inline=False)
+    embed.add_field(name="/sherlock", value="scan étendu 400+ sites", inline=False)
+    embed.add_field(name="/holehe", value="email sur 120+ sites (cible non notifiée)", inline=False)
     embed.add_field(name="/email", value="check email dans HIBP + Firefox Monitor", inline=False)
     embed.add_field(name="/domain", value="DNS + WHOIS + crt.sh + archive + VT", inline=False)
     embed.add_field(name="/dns", value="résolution DNS A/MX/NS/TXT", inline=False)
