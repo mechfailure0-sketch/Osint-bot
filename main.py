@@ -28,7 +28,6 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 # ============================================================
 # USERNAME SITES — detection par signature de contenu
-# format : nom -> (url, [signatures "not found"] ou None)
 # ============================================================
 USERNAME_SITES = {
     "GitHub":       ("https://github.com/{}", ["Not Found"]),
@@ -195,12 +194,12 @@ async def sherlock_cmd(interaction: discord.Interaction, pseudo: str):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             outfile = f.name
         proc = await asyncio.create_subprocess_exec(
-            "sherlock", pseudo, "--print-found", "--timeout", "10",
+            "sherlock", pseudo, "--print-found", "--timeout", "20",
             "--output", outfile,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await asyncio.wait_for(proc.communicate(), timeout=150)
+        await asyncio.wait_for(proc.communicate(), timeout=300)
         with open(outfile, "r", errors="ignore") as f:
             content = f.read()
         lines = [l.strip() for l in content.splitlines() if l.strip().startswith("http")]
@@ -217,12 +216,12 @@ async def sherlock_cmd(interaction: discord.Interaction, pseudo: str):
             if len(lines) > 25:
                 embed.set_footer(text=f"+{len(lines)-25} autres résultats")
             else:
-                embed.set_footer(text="scan sherlock-project")
+                embed.set_footer(text="scan sherlock-project — timeout 20s/site")
         else:
             embed.description = "aucun résultat public"
         await interaction.followup.send(embed=embed)
     except asyncio.TimeoutError:
-        await interaction.followup.send("⏱️ timeout — le scan a dépassé 2min30")
+        await interaction.followup.send("⏱️ timeout — le scan a dépassé 5 minutes")
     except Exception as e:
         await interaction.followup.send(f"erreur : {str(e)[:200]}")
 
@@ -359,9 +358,9 @@ async def image_cmd(interaction: discord.Interaction, fichier: discord.Attachmen
         exif = extract_exif(data)
     except Exception as e:
         await interaction.followup.send(f"erreur lecture : {e}")
-        return
-    embed = discord.Embed(title="EXIF — image", color=0x00b0ff)
-    if "format" in exif:
+        return="
+    embed = discord.Embed(title="whoEXIF — image", color=is0x00b0ff)
+    if "format" complet in ex dif:
         embed.add_field(name="format",
                         value=f"{exif.get('format')} — {exif.get('size')}",
                         inline=False)
@@ -457,7 +456,7 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(name="/email", value="check email dans HIBP + Firefox Monitor", inline=False)
     embed.add_field(name="/domain", value="DNS + WHOIS + crt.sh + archive + VT", inline=False)
     embed.add_field(name="/dns", value="résolution DNS A/MX/NS/TXT", inline=False)
-    embed.add_field(name="/whois", value="whois complet d'un domaine", inline=False)
+    embed.add_field(name="/whois", value'un domaine", inline=False)
     embed.add_field(name="/ip", value="ipinfo + Shodan + AbuseIPDB + VT", inline=False)
     embed.add_field(name="/image", value="extrait EXIF (GPS, appareil, date)", inline=False)
     embed.add_field(name="/reverse", value="reverse image search", inline=False)
